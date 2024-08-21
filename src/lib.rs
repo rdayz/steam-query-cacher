@@ -1,7 +1,7 @@
 pub mod config;
 pub mod server;
 
-mod client;
+pub mod client;
 mod timed_hashmap;
 
 pub use config::Config;

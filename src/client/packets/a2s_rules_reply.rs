@@ -1,4 +1,9 @@
-use super::{QueryHeader, SourceQueryResponse};
+use super::QueryHeader;
+use super::SourceQueryResponse;
+use byteorder::{LittleEndian, ReadBytesExt};
+use serde::Serialize;
+use std::io::Cursor;
+use std::io::Read;
 
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -11,9 +16,10 @@ pub struct A2SRule {
 #[repr(C)]
 pub struct A2SRulesReply {
     pub header: QueryHeader,
-    pub num_rules: i16,
     pub rules: Vec<A2SRule>,
+    pub mods: Vec<Mod>,
 }
+
 
 impl SourceQueryResponse for A2SRulesReply {
     fn packet_header() -> QueryHeader {
@@ -23,29 +29,73 @@ impl SourceQueryResponse for A2SRulesReply {
 
 impl Into<Vec<u8>> for A2SRulesReply {
     fn into(self) -> Vec<u8> {
-        let mut data: Vec<u8> = Vec::with_capacity(1 + 1 + self.rules.len() * 10);
-
-        let header: u8 = self.header.into();
-        data.push(header);
-        data.extend(self.num_rules.to_le_bytes());
-
-        for rule in self.rules {
-            data.extend(rule.name.into_bytes());
-            data.push(0x00);
-            data.extend(rule.value.into_bytes());
-            data.push(0x00);
-        }
-
-        data
+        vec![]
     }
+}
+
+fn read_byte(c: &mut Cursor<Vec<u8>>) -> u8 {
+    let byte = c.read_u8().unwrap();
+    if byte == 1 {
+        let byte2 = c.read_u8().unwrap();
+        if byte2 == 1 {
+            return 1;
+        } else if byte2 == 2 {
+            return 0;
+        } else if byte2 == 3 {
+            return 0xff;
+        }
+    }
+
+    byte
+}
+
+fn read_uint4(c: &mut Cursor<Vec<u8>>) -> u32 {
+    let buffer: Vec<u8> = vec![read_byte(c), read_byte(c), read_byte(c), read_byte(c)];
+    let mut cursor = Cursor::new(buffer);
+    cursor.read_u32::<LittleEndian>().unwrap()
+}
+
+fn read_string(c: &mut Cursor<Vec<u8>>) -> String {
+    let len = read_byte(c);
+    let mut buffer: Vec<u8> = Vec::default();
+    for _ in 0..len {
+        buffer.push(read_byte(c));
+    }
+
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+trait ReadCString {
+    fn read_cstring(&mut self) -> String;
+}
+
+impl ReadCString for Cursor<Vec<u8>> {
+    fn read_cstring(&mut self) -> String {
+        let end = self.get_ref().len() as u64;
+        let mut buf = [0; 1];
+        let mut str_vec = Vec::with_capacity(256);
+        while self.position() < end {
+            self.read_exact(&mut buf).unwrap();
+            if buf[0] == 0 {
+                break;
+            } else {
+                str_vec.push(buf[0]);
+            }
+        }
+        String::from_utf8_lossy(&str_vec[..]).into_owned()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Mod {
+    pub id: u32,
+    pub name: String,
 }
 
 impl TryFrom<&[u8]> for A2SRulesReply {
     type Error = std::io::Error;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let mut data = value;
-
-        let header = match QueryHeader::try_from(data[0]) {
+        let header = match QueryHeader::try_from(value[0]) {
             Ok(header) => header,
             Err(_) => {
                 return Err(std::io::Error::new(
@@ -54,7 +104,6 @@ impl TryFrom<&[u8]> for A2SRulesReply {
                 ))
             }
         };
-        data = &data[1..];
 
         if header != QueryHeader::A2SRulesReply {
             return Err(std::io::Error::new(
@@ -63,51 +112,71 @@ impl TryFrom<&[u8]> for A2SRulesReply {
             ));
         }
 
-        let num_rules = i16::from_le_bytes(match data[0..2].try_into() {
-            Ok(num_rules) => num_rules,
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid num_rules",
-                ))
+        let mut data: Cursor<Vec<u8>> = Cursor::new(value.to_vec());
+        data.read_u8().unwrap();
+
+        let count = data.read_u16::<LittleEndian>()?;
+        let mut rules: Vec<A2SRule> = Vec::new();
+        let mut payload: Vec<u8> = Vec::default();
+        for _ in 0..count {
+            if data.read_u8().unwrap() != 0
+                && data.read_u8().unwrap() != 0
+                && data.read_u8().unwrap() == 0
+            {
+                loop {
+                    let byte = data.read_u8().unwrap();
+                    if byte == 0 {
+                        break;
+                    }
+
+                    payload.push(byte);
+                }
+
+                continue;
+            } else {
+                data.set_position(data.position() - 3);
             }
-        });
-        data = &data[2..];
 
-        let mut rules: Vec<A2SRule> = Vec::with_capacity(num_rules as usize);
+            rules.push(A2SRule {
+                name: data.read_cstring(),
+                value: data.read_cstring(),
+            });
+        }
 
-        for _ in 0..num_rules {
-            let name =
-                match String::from_utf8(data.iter().take_while(|&&c| c != 0).cloned().collect()) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Invalid name",
-                        ))
-                    }
-                };
-            data = &data[name.len() + 1..];
+        let mut test = Cursor::new(payload);
+        read_byte(&mut test);
+        read_byte(&mut test);
 
-            let value =
-                match String::from_utf8(data.iter().take_while(|&&c| c != 0).cloned().collect()) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Invalid value",
-                        ))
-                    }
-                };
-            data = &data[value.len() + 1..];
+        let dlc1 = read_byte(&mut test);
+        let dlc2 = read_byte(&mut test);
+        if dlc1 != 0 {
+            read_uint4(&mut test);
+        }
 
-            rules.push(A2SRule { name, value });
+        if dlc2 != 0 {
+            read_uint4(&mut test);
+        }
+
+        let mut mods: Vec<Mod> = Vec::new();
+        for _ in 0..read_byte(&mut test) {
+            read_uint4(&mut test);
+
+            let pos = test.position();
+            let flag = read_byte(&mut test);
+            if flag != 4 {
+                test.set_position(pos);
+            }
+
+            mods.push(Mod {
+                id: read_uint4(&mut test),
+                name: read_string(&mut test),
+            });
         }
 
         Ok(Self {
-            header,
-            num_rules,
+            header: QueryHeader::A2SRulesReply,
             rules,
+            mods
         })
     }
 }
