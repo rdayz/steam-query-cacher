@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::io::Read;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[repr(C)]
 pub struct A2SRule {
     pub name: String,
